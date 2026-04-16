@@ -165,6 +165,7 @@ archive/
 # Local virtual environments created during experiments
 .skel_venv/
 .skel_venv312/
+.pose_venv/
 
 # macOS
 .DS_Store

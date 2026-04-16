@@ -67,7 +67,7 @@ import sys
 required = [
     ("numpy", "numpy"),
     ("cv2", "opencv-python"),
-    ("mediapipe", "mediapipe"),
+    ("mediapipe", "mediapipe==0.10.14"),
 ]
 missing_pkgs = [pkg for mod, pkg in required if importlib.util.find_spec(mod) is None]
 if missing_pkgs:
@@ -76,6 +76,12 @@ if missing_pkgs:
     subprocess.check_call(cmd)
 else:
     print("[bootstrap] all required packages already installed")
+
+# MediaPipe API compatibility check: this pipeline uses mp.solutions.*
+import mediapipe as mp
+if not hasattr(mp, "solutions"):
+    print("[bootstrap] mediapipe lacks mp.solutions; reinstalling compatible version 0.10.14")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "--force-reinstall", "mediapipe==0.10.14"])
 PY
 
 # ---------- Pipeline ----------
