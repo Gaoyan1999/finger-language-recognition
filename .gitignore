@@ -146,15 +146,15 @@ dmypy.json
 # Cython debug symbols
 cython_debug/
 
-# Model training and data
-data/
-models/
-checkpoints/
+# Model training and data (repo root only)
+/data/
+/models/
+/checkpoints/
 *.pth
 *.pt
 *.ckpt
 *.h5
-runs/
+/runs/
 wandb/
 mlruns/
 
