@@ -157,3 +157,17 @@ checkpoints/
 runs/
 wandb/
 mlruns/
+
+
+# dataset
+archive/
+
+# Local virtual environments created during experiments
+.skel_venv/
+.skel_venv312/
+
+# macOS
+.DS_Store
+
+# Generated preprocessing reports/previews
+reports/pose_quality/*.csv
