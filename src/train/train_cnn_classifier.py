@@ -32,18 +32,68 @@ class PoseNPZDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
+    @staticmethod
+    def _normalize_keypoints(
+        keypoints: np.ndarray,
+        mask: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Normalize each frame to a body-centric coordinate system.
+        Center: shoulder midpoint when available, otherwise visible body centroid.
+        Scale: shoulder distance when available, otherwise mean visible distance.
+        """
+        xy = keypoints[..., :2].copy()  # [T,75,2]
+        z = keypoints[..., 2:3].copy()  # [T,75,1]
+        t = xy.shape[0]
+
+        body_xy = xy[:, :33, :]
+        body_mask = mask[:, :33]
+
+        # Body centroid fallback.
+        body_count = np.maximum(body_mask.sum(axis=1, keepdims=True), 1.0)  # [T,1]
+        body_center = (body_xy * body_mask[..., None]).sum(axis=1) / body_count  # [T,2]
+
+        # Prefer shoulder midpoint when both shoulders are visible.
+        l_shoulder = xy[:, 11, :]
+        r_shoulder = xy[:, 12, :]
+        shoulder_valid = (mask[:, 11] > 0.5) & (mask[:, 12] > 0.5)
+        shoulder_center = (l_shoulder + r_shoulder) / 2.0
+        center = body_center.copy()
+        center[shoulder_valid] = shoulder_center[shoulder_valid]
+
+        # Scale by shoulder distance when possible, otherwise by mean visible radius.
+        shoulder_dist = np.linalg.norm(l_shoulder - r_shoulder, axis=1)  # [T]
+        dist_from_center = np.linalg.norm(xy - center[:, None, :], axis=2)  # [T,75]
+        visible_count = np.maximum(mask.sum(axis=1), 1.0)  # [T]
+        mean_visible_dist = (dist_from_center * mask).sum(axis=1) / visible_count  # [T]
+        scale = np.where(shoulder_valid, shoulder_dist, mean_visible_dist)
+        scale = np.maximum(scale, 1e-3).astype(np.float32)  # [T]
+
+        xy = (xy - center[:, None, :]) / scale[:, None, None]
+        z = z / scale[:, None, None]
+        out = np.concatenate([xy, z], axis=2)  # [T,75,3]
+        return out.astype(np.float32)
+
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         s = self.samples[idx]
         d = np.load(s.npz_path, allow_pickle=True)
         keypoints = np.asarray(d["keypoints"], dtype=np.float32)  # [T,75,3]
         mask = np.asarray(d["mask"], dtype=np.float32)  # [T,75]
-        mask = mask[..., None]  # [T,75,1]
+        mask = np.clip(mask, 0.0, 1.0)
+        mask_3d = mask[..., None]  # [T,75,1]
 
-        # Keep keypoints only where detection exists.
-        x = keypoints * mask
-        # 1D temporal CNN expects [C, T]. We flatten per-frame keypoints:
-        # [T,75,3] -> [T,225] -> [225,T]
-        x = x.reshape(x.shape[0], -1)
+        # (2) Normalize to body-centric frame, then keep only detected points.
+        coords = self._normalize_keypoints(keypoints=keypoints, mask=mask) * mask_3d  # [T,75,3]
+        # (3) Add temporal first-order differences as motion features.
+        dx = np.zeros_like(coords, dtype=np.float32)
+        dx[1:] = coords[1:] - coords[:-1]
+        dx = dx * mask_3d
+        # (1) Keep mask as explicit feature channels.
+        feat = np.concatenate([coords, dx, mask_3d], axis=2)  # [T,75,7]
+
+        # 1D temporal CNN expects [C, T]. Flatten per frame:
+        # [T,75,7] -> [T,525] -> [525,T]
+        x = feat.reshape(feat.shape[0], -1)
         x = np.transpose(x, (1, 0))
         x_t = torch.from_numpy(x)
         y_t = torch.tensor(s.label_id, dtype=torch.long)
