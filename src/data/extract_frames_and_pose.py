@@ -1,11 +1,14 @@
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
+import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import mediapipe as mp
 import numpy as np
+from tqdm import tqdm
 
 
 BODY_KEYPOINT_NAMES: List[str] = [
@@ -176,6 +179,131 @@ def pose_from_mediapipe(
     return keypoints, mask
 
 
+_THREAD_LOCAL = threading.local()
+
+
+def get_thread_models(hand_min_conf: float) -> Tuple[Any, Any]:
+    if getattr(_THREAD_LOCAL, "hands_model", None) is None:
+        mp_hands = mp.solutions.hands
+        mp_pose = mp.solutions.pose
+        _THREAD_LOCAL.hands_model = mp_hands.Hands(
+            static_image_mode=False,
+            max_num_hands=2,
+            model_complexity=1,
+            min_detection_confidence=float(hand_min_conf),
+            min_tracking_confidence=float(hand_min_conf),
+        )
+        _THREAD_LOCAL.pose_model = mp_pose.Pose(
+            static_image_mode=False,
+            model_complexity=1,
+            enable_segmentation=False,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+    return _THREAD_LOCAL.hands_model, _THREAD_LOCAL.pose_model
+
+
+def process_instance(
+    inst: Dict[str, Any],
+    idx_by_instance_id: Dict[int, Dict[str, Any]],
+    args: argparse.Namespace,
+    out_dir: str,
+) -> Tuple[bool, str]:
+    instance_id = int(inst["instance_id"])
+    gloss = inst["gloss"]
+    local_video_path = inst["local_video_path"]
+    bbox = inst["bbox"]
+    frame_start = int(inst["frame_start"])
+    frame_end = int(inst["frame_end"])
+
+    meta_entry = idx_by_instance_id.get(instance_id)
+    if meta_entry and meta_entry.get("video_meta"):
+        frame_count = int(meta_entry["video_meta"].get("frame_count") or 0)
+    else:
+        frame_count = 0
+
+    if not local_video_path or not os.path.exists(local_video_path):
+        return False, f"skip missing video: {local_video_path}"
+
+    vmeta = read_video_metadata(local_video_path)
+    if not frame_count:
+        frame_count = int(vmeta.get("frame_count") or 0)
+    if frame_count <= 0:
+        return False, f"skip unreadable video: {local_video_path}"
+
+    sampled = sample_frame_indices(
+        frame_start_1based=frame_start,
+        frame_end=frame_end,
+        T=int(args.T),
+        frame_count=frame_count,
+        max_len_when_end_unknown=int(args.max_len_when_end_unknown),
+    )
+    sampled_list = sampled.tolist()
+
+    cap = cv2.VideoCapture(local_video_path)
+    if not cap.isOpened():
+        return False, f"cap open failed: {local_video_path}"
+
+    keypoints_full = np.zeros((args.T, 75, 3), dtype=np.float32)  # body33 + hands42
+    mask_full = np.zeros((args.T, 75), dtype=np.float32)
+
+    hands_model, pose_model = get_thread_models(float(args.hand_min_conf))
+
+    ok_first = False
+    bbox_expanded = [0, 0, 1, 1]
+    for t_i, idx0 in enumerate(sampled_list):
+        if t_i == 0:
+            frame0 = read_frame_at(cap, idx0)
+            if frame0 is None:
+                continue
+            img_h, img_w = frame0.shape[:2]
+            bbox_expanded = expand_bbox(bbox, img_w=img_w, img_h=img_h, margin_ratio=float(args.bbox_margin_ratio))
+            ok_first = True
+            frame = frame0
+        else:
+            frame = read_frame_at(cap, idx0)
+            if frame is None:
+                continue
+
+        if not ok_first:
+            continue
+
+        x1, y1, x2, y2 = bbox_expanded
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            continue
+        resized = cv2.resize(crop, (int(args.input_size), int(args.input_size)), interpolation=cv2.INTER_LINEAR)
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+
+        k_h, m_h = hands_from_mediapipe(hands_model, rgb)
+        k_b, m_b = pose_from_mediapipe(pose_model, rgb, body_visibility_threshold=float(args.pose_body_visibility_threshold))
+
+        keypoints_full[t_i, 0:33] = k_b
+        mask_full[t_i, 0:33] = m_b
+        keypoints_full[t_i, 33:75] = k_h
+        mask_full[t_i, 33:75] = m_h
+
+    cap.release()
+
+    full_out_dir = os.path.join(out_dir, "mediapipe_full_pose")
+    os.makedirs(full_out_dir, exist_ok=True)
+    full_out_path = os.path.join(full_out_dir, f"{gloss}__{instance_id}.npz")
+
+    hand_names: List[str] = [f"left_hand_{i}" for i in range(21)] + [f"right_hand_{i}" for i in range(21)]
+    full_names = BODY_KEYPOINT_NAMES + hand_names
+    np.savez_compressed(
+        full_out_path,
+        keypoints=keypoints_full,
+        mask=mask_full,
+        sampled_frame_indices=np.asarray(sampled_list, dtype=np.int64),
+        bbox_used=np.asarray(bbox, dtype=np.float32),
+        bbox_expanded=np.asarray(bbox_expanded, dtype=np.float32),
+        input_size=np.asarray([args.input_size], dtype=np.int32),
+        keypoint_names=np.asarray(full_names, dtype=object),
+    )
+    return True, f"ok gloss={gloss} instance_id={instance_id} frames={len(sampled_list)}"
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--demo_manifest", required=True, help="data/preprocess_manifests/demo_instances_top20x3.json")
@@ -183,13 +311,14 @@ def main() -> None:
     ap.add_argument("--videos_root", required=True, help="archive/videos")
     ap.add_argument("--out_dir", required=True, help="data/pose_outputs")
 
-    ap.add_argument("--T", type=int, default=16)
+    ap.add_argument("--T", type=int, default=32)
     ap.add_argument("--max_len_when_end_unknown", type=int, default=64)
     ap.add_argument("--bbox_margin_ratio", type=float, default=0.2)
 
     ap.add_argument("--input_size", type=int, default=256, help="Resize cropped frame to square input for pose models")
     ap.add_argument("--hand_min_conf", type=float, default=0.5)
     ap.add_argument("--pose_body_visibility_threshold", type=float, default=0.2)
+    ap.add_argument("--num_workers", type=int, default=4, help="Thread workers for instance-level preprocessing")
 
     args = ap.parse_args()
 
@@ -203,134 +332,27 @@ def main() -> None:
 
     os.makedirs(args.out_dir, exist_ok=True)
 
-    mp_hands = mp.solutions.hands
-    mp_pose = mp.solutions.pose
-
-    hands_model = mp_hands.Hands(
-        static_image_mode=False,
-        max_num_hands=2,
-        model_complexity=1,
-        min_detection_confidence=float(args.hand_min_conf),
-        min_tracking_confidence=float(args.hand_min_conf),
-    )
-    pose_model = mp_pose.Pose(
-        static_image_mode=False,
-        model_complexity=1,
-        enable_segmentation=False,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-    )
-
-    for i, inst in enumerate(instances):
-        instance_id = int(inst["instance_id"])
-        gloss = inst["gloss"]
-        split = inst.get("split", "unknown")
-        local_video_path = inst["local_video_path"]
-        bbox = inst["bbox"]
-        frame_start = int(inst["frame_start"])
-        frame_end = int(inst["frame_end"])
-
-        # video meta (frame_count) from earlier mapping
-        meta_entry = idx_by_instance_id.get(instance_id)
-        if meta_entry and meta_entry.get("video_meta"):
-            frame_count = int(meta_entry["video_meta"].get("frame_count") or 0)
-        else:
-            frame_count = 0
-
-        if not local_video_path or not os.path.exists(local_video_path):
-            print(f"[extract] skip missing video: {local_video_path}")
-            continue
-
-        vmeta = read_video_metadata(local_video_path)
-        if not frame_count:
-            frame_count = int(vmeta.get("frame_count") or 0)
-        if frame_count <= 0:
-            print(f"[extract] skip unreadable video: {local_video_path}")
-            continue
-
-        sampled = sample_frame_indices(
-            frame_start_1based=frame_start,
-            frame_end=frame_end,
-            T=int(args.T),
-            frame_count=frame_count,
-            max_len_when_end_unknown=int(args.max_len_when_end_unknown),
-        )
-        sampled_list = sampled.tolist()
-
-        cap = cv2.VideoCapture(local_video_path)
-        if not cap.isOpened():
-            print(f"[extract] cap open failed: {local_video_path}")
-            continue
-
-        # Pre-allocate output tensors
-        keypoints_hands = np.zeros((args.T, 42, 3), dtype=np.float32)
-        mask_hands = np.zeros((args.T, 42), dtype=np.float32)
-
-        keypoints_full = np.zeros((args.T, 75, 3), dtype=np.float32)  # body33 + hands42
-        mask_full = np.zeros((args.T, 75), dtype=np.float32)
-
-        # bbox expanded computed from the first frame's width/height
-        # (bbox is provided in original pixel coords, so we need image size)
-        ok_first = False
-        for t_i, idx0 in enumerate(sampled_list):
-            if t_i == 0:
-                frame0 = read_frame_at(cap, idx0)
-                if frame0 is None:
-                    continue
-                img_h, img_w = frame0.shape[:2]
-                bbox_expanded = expand_bbox(bbox, img_w=img_w, img_h=img_h, margin_ratio=float(args.bbox_margin_ratio))
-                ok_first = True
-                # Use frame0 for this t_i
-                frame = frame0
+    ok_count = 0
+    fail_count = 0
+    with ThreadPoolExecutor(max_workers=max(1, int(args.num_workers))) as ex:
+        futures = [
+            ex.submit(
+                process_instance,
+                inst=inst,
+                idx_by_instance_id=idx_by_instance_id,
+                args=args,
+                out_dir=args.out_dir,
+            )
+            for inst in instances
+        ]
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="[extract] instances", unit="inst"):
+            ok, msg = fut.result()
+            if ok:
+                ok_count += 1
             else:
-                frame = read_frame_at(cap, idx0)
-                if frame is None:
-                    continue
-
-            if not ok_first:
-                continue
-
-            x1, y1, x2, y2 = bbox_expanded
-            crop = frame[y1:y2, x1:x2]
-            if crop.size == 0:
-                continue
-            resized = cv2.resize(crop, (int(args.input_size), int(args.input_size)), interpolation=cv2.INTER_LINEAR)
-            rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-
-            k_h, m_h = hands_from_mediapipe(hands_model, rgb)
-            k_b, m_b = pose_from_mediapipe(pose_model, rgb, body_visibility_threshold=float(args.pose_body_visibility_threshold))
-
-            keypoints_hands[t_i] = k_h
-            mask_hands[t_i] = m_h
-
-            keypoints_full[t_i, 0:33] = k_b
-            mask_full[t_i, 0:33] = m_b
-            keypoints_full[t_i, 33:75] = k_h
-            mask_full[t_i, 33:75] = m_h
-
-        cap.release()
-
-        full_out_dir = os.path.join(args.out_dir, "mediapipe_full_pose")
-        os.makedirs(full_out_dir, exist_ok=True)
-
-        full_out_path = os.path.join(full_out_dir, f"{gloss}__{instance_id}.npz")
-
-        # keypoint names for full pose: body + hands (hands indices are numeric)
-        hand_names: List[str] = [f"left_hand_{i}" for i in range(21)] + [f"right_hand_{i}" for i in range(21)]
-        full_names = BODY_KEYPOINT_NAMES + hand_names
-
-        np.savez_compressed(
-            full_out_path,
-            keypoints=keypoints_full,
-            mask=mask_full,
-            sampled_frame_indices=np.asarray(sampled_list, dtype=np.int64),
-            bbox_used=np.asarray(bbox, dtype=np.float32),
-            bbox_expanded=np.asarray(bbox_expanded, dtype=np.float32),
-            input_size=np.asarray([args.input_size], dtype=np.int32),
-            keypoint_names=np.asarray(full_names, dtype=object),
-        )
-
-        print(f"[extract] {i+1}/{len(instances)} gloss={gloss} instance_id={instance_id} frames={len(sampled_list)}")
+                fail_count += 1
+                print(f"[extract] {msg}")
+    print(f"[extract] done ok={ok_count} failed={fail_count} total={len(instances)}")
 
 
 if __name__ == "__main__":

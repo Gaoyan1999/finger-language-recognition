@@ -41,34 +41,38 @@ class PoseNPZDataset(Dataset):
 
         # Keep keypoints only where detection exists.
         x = keypoints * mask
-        # CNN expects channels-first: [C=3, T, K=75]
-        x = np.transpose(x, (2, 0, 1))
+        # 1D temporal CNN expects [C, T]. We flatten per-frame keypoints:
+        # [T,75,3] -> [T,225] -> [225,T]
+        x = x.reshape(x.shape[0], -1)
+        x = np.transpose(x, (1, 0))
         x_t = torch.from_numpy(x)
         y_t = torch.tensor(s.label_id, dtype=torch.long)
         return x_t, y_t
 
 
-class PoseCNN(nn.Module):
-    def __init__(self, num_classes: int, dropout: float = 0.2) -> None:
+class PoseTemporalCNN(nn.Module):
+    def __init__(self, in_channels: int, num_classes: int, dropout: float = 0.2) -> None:
         super().__init__()
         self.features = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
+            nn.Conv1d(in_channels, 256, kernel_size=3, padding=1),
+            nn.BatchNorm1d(256),
             nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
+            nn.Conv1d(256, 256, kernel_size=3, padding=1),
+            nn.BatchNorm1d(256),
             nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2),
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
+            nn.MaxPool1d(kernel_size=2),
+            nn.Conv1d(256, 384, kernel_size=3, padding=1),
+            nn.BatchNorm1d(384),
             nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Conv1d(384, 384, kernel_size=3, padding=1),
+            nn.BatchNorm1d(384),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool1d(1),
         )
         self.classifier = nn.Sequential(
             nn.Flatten(),
             nn.Dropout(p=dropout),
-            nn.Linear(128, num_classes),
+            nn.Linear(384, num_classes),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -180,30 +184,38 @@ def main() -> None:
     val_ds = PoseNPZDataset(val_s)
     test_ds = PoseNPZDataset(test_s)
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    pin_memory = device.type == "cuda"
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
     )
     test_loader = DataLoader(
         test_ds,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
     )
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = PoseCNN(num_classes=len(gloss_to_id), dropout=args.dropout).to(device)
+    sample_x, _ = train_ds[0]
+    in_channels = int(sample_x.shape[0])
+    model = PoseTemporalCNN(
+        in_channels=in_channels,
+        num_classes=len(gloss_to_id),
+        dropout=args.dropout,
+    ).to(device)
+    print(f"[model] temporal_cnn_1d in_channels={in_channels}")
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(
         model.parameters(),

@@ -13,7 +13,7 @@ set -euo pipefail
 # Optional overrides:
 #   WLASL_JSON="/Users/daniel/Downloads/archive/WLASL_v0.3.json" \
 #   VIDEOS_ROOT="/Users/daniel/Downloads/archive/videos" \
-#   TOP_K=100 T=16 INPUT_SIZE=256 \
+#   TOP_K=100 T=32 INPUT_SIZE=256 \
 #   bash scripts/run_top100_fullpose.sh
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -22,7 +22,7 @@ cd "$REPO_ROOT"
 WLASL_JSON="${WLASL_JSON:-/Users/daniel/Downloads/archive/WLASL_v0.3.json}"
 VIDEOS_ROOT="${VIDEOS_ROOT:-/Users/daniel/Downloads/archive/videos}"
 TOP_K="${TOP_K:-100}"
-T="${T:-16}"
+T="${T:-32}"
 INPUT_SIZE="${INPUT_SIZE:-256}"
 MAX_LEN_UNKNOWN="${MAX_LEN_UNKNOWN:-64}"
 BBOX_MARGIN_RATIO="${BBOX_MARGIN_RATIO:-0.2}"
@@ -68,6 +68,7 @@ required = [
     ("numpy", "numpy"),
     ("cv2", "opencv-python"),
     ("mediapipe", "mediapipe==0.10.14"),
+    ("tqdm", "tqdm"),
 ]
 missing_pkgs = [pkg for mod, pkg in required if importlib.util.find_spec(mod) is None]
 if missing_pkgs:
